@@ -1035,8 +1035,15 @@ func (keyProtectCryptoUnitAPI *KeyProtectCryptoUnitAPI) ImportMasterKey(cryptoUn
 //   - cryptoUnitID: The ID of the crypto unit to import the Master Key to
 //   - request: ImportMaster KeyRequest containing the key specifications and slot number
 //
+// Like the 'master-key import' CLI command, when request.SlotNo is 0 or 3 the key
+// is imported into the backup slot (8) and then the active slot (3), passing the
+// number of authenticated admins to the management service. Afterwards the
+// database record of the unit is seeded. If only that seeding fails, the HSM
+// import has still succeeded and the returned error wraps ErrMBKSeedFailed
+// (check with errors.Is, then run SyncMasterKeyRecord). Any other SlotNo imports
+// into that single slot only and does not seed.
+//
 // Returns:
-//   - string: Response data from the import operation
 //   - error: Any error that occurred during the import
 //
 // Example:
@@ -1050,7 +1057,6 @@ func (keyProtectCryptoUnitAPI *KeyProtectCryptoUnitAPI) ImportMasterKeyWithConte
 	// (auth tokens, headers) are still inherited from the parent context.
 	ctx = detachContext(ctx)
 
-	logger := keyProtectCryptoUnitAPI.logger
 	if request == nil {
 		return fmt.Errorf("request cannot be nil")
 	}
@@ -1069,16 +1075,9 @@ func (keyProtectCryptoUnitAPI *KeyProtectCryptoUnitAPI) ImportMasterKeyWithConte
 		slotNo = 3
 	}
 
-	sessionID, err := keyProtectCryptoUnitAPI.getSessionID(cryptoUnitID)
-	if err != nil {
+	if _, err := keyProtectCryptoUnitAPI.getSessionID(cryptoUnitID); err != nil {
 		return err
 	}
-	sdkHeaders := createHeadersfromContext(ctx, "import-master-key", keyProtectCryptoUnitAPI.instanceID)
-	logger.Debug("sdkHeaders for ImportMasterKey = ")
-	for key, val := range sdkHeaders {
-		logger.Debug("    %s: %s", key, val)
-	}
-
 	// Join the KeyShareFiles slice to comma-separated string
 	keyspec := strings.Join(request.KeyShareFiles, ",")
 
@@ -1091,18 +1090,15 @@ func (keyProtectCryptoUnitAPI *KeyProtectCryptoUnitAPI) ImportMasterKeyWithConte
 			}
 		}
 	}
-	// Pass the comma-separated string to the C func
-	err = callImportMasterKey(
-		sessionID,
-		keyspec, // Pass as comma-separated: "file1.key#pwd1,file2.key#pwd2,file3.key#pwd3"
-		slotNo,
-		sdkHeaders,
-	)
-	if err != nil {
-		return wrapError(err, fmt.Sprintf("failed to import Master Key for crypto unit %s", cryptoUnitID))
+	// A specific slot other than the active one is imported as is.
+	if slotNo != MBKSlotActive {
+		if err := keyProtectCryptoUnitAPI.importKey(ctx, cryptoUnitID, keyspec, slotNo, 0, false); err != nil {
+			return wrapError(err, fmt.Sprintf("failed to import Master Key for crypto unit %s", cryptoUnitID))
+		}
+		return nil
 	}
 
-	return nil
+	return importMasterKeyAndSeed(ctx, keyProtectCryptoUnitAPI, cryptoUnitID, keyspec)
 }
 
 // ImportMasterKeyToCryptoUnits imports an Master Key to multiple crypto units concurrently using goroutines
@@ -1147,7 +1143,10 @@ func (keyProtectCryptoUnitAPI *KeyProtectCryptoUnitAPI) ImportMasterKeyToCryptoU
 			fmt.Sprintf("Importing Master Key to crypto unit %s...", cryptoUnitID),
 		)
 		err := keyProtectCryptoUnitAPI.ImportMasterKeyWithContext(ctx, cryptoUnitID, request)
-		if err != nil {
+		if errors.Is(err, ErrMBKSeedFailed) {
+			// The HSM import succeeded; only the record seeding needs a record-sync.
+			logger.Warn("%s", err.Error())
+		} else if err != nil {
 			logger.Error("error from import masterkey to cryptounit %s: %s", cryptoUnitID, err.Error())
 			allErrs = errors.Join(allErrs, fmt.Errorf("import master key to cryptounit %s failed: %w", cryptoUnitID, err))
 		}

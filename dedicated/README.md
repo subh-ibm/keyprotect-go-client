@@ -228,9 +228,64 @@ thresholds, err = client.GetThreshold(cryptoUnitID)
 - ListMasterKeysWithContext(ctx context.Context, cryptoUnitID string) ([]MasterKeyInfo, error) - Lists master keys with context
 - GenerateMasterKey(cryptoUnitID string, mbkSpec *MasterKeyPartsSpec) (string, error) - Generates a master key
 - GenerateMasterKeyWithContext(ctx context.Context, cryptoUnitID string, mbkSpec *MasterKeyPartsSpec) (string, error) - Generates master key with context
-- ImportMasterKey(cryptoUnitID string, mbkSpec *MasterKeyPartsSpec) error - Imports a master key
+- ImportMasterKey(cryptoUnitID string, mbkSpec *MasterKeyPartsSpec) error - Imports a master key (slots 8 and 3, then seeds the record)
 - ImportMasterKeyWithContext(ctx context.Context, cryptoUnitID string, request *MasterKeyPartsSpec) error - Imports master key with context
 - ImportMasterKeyToCryptoUnits(ctx context.Context, cryptoUnitIDs []string, request *MasterKeyPartsSpec) error - Imports master key to multiple crypto units
+
+##### Import behavior
+
+Import follows the `master-key import` CLI command. With the default slot (`SlotNo` 0 or 3) the key is imported
+into the backup slot 8 and then the active slot 3. The number of authenticated admins of the session is sent to the
+management service, so the crypto unit must be connected with enough admins to satisfy the signature threshold
+(see `CreateCryptoUnitSession` and `LoginSpec.AdditionalAuths`). Afterwards the master key record of the crypto unit
+is seeded in the database.
+
+If only the seeding fails, the HSM import has succeeded and the error wraps `ErrMBKSeedFailed`. Check for it with
+`errors.Is` and run `SyncMasterKeyRecord`. `ImportMasterKeyToCryptoUnits` logs this as a warning and does not fail.
+Any other `SlotNo` imports into that single slot only and does not seed.
+
+#### Master Key Rotation
+
+- GetMasterKeyState(cryptoUnitID string) (*CryptoUnitMBKState, error) - Reads the master key state held by the management service (hash, rotation count, import flags). Needs no session, so it suits a Terraform read.
+- GetMasterKeyStateWithContext(ctx context.Context, cryptoUnitID string) (*CryptoUnitMBKState, error) - Same, with context
+- RotateMasterKey(cryptoUnitID string, spec *MasterKeyPartsSpec) (*MBKRotationResult, error) - Rotates the master key of one crypto unit
+- RotateMasterKeyWithContext(ctx context.Context, cryptoUnitID string, spec *MasterKeyPartsSpec) (*MBKRotationResult, error) - Same, with context
+- RotateMasterKeyOnCryptoUnits(ctx context.Context, cryptoUnitIDs []string, spec *MasterKeyPartsSpec) ([]MBKRotationResult, error) - Rotates several crypto units of an instance
+- SyncMasterKeyRecord(cryptoUnitID string) (*RecordSyncResult, error) - Seeds or repairs the management service record from the HSM
+- SyncMasterKeyRecordWithContext(ctx context.Context, cryptoUnitID string) (*RecordSyncResult, error) - Same, with context
+- SyncMasterKeyRecordOnCryptoUnits(ctx context.Context, cryptoUnitIDs []string) ([]RecordSyncResult, error) - Same for several crypto units
+
+Rotation follows the `master-key rotate` CLI command: the new key shares must already exist
+(`GenerateMasterKey`), and the client must be connected to every crypto unit with enough admins to satisfy the
+signature threshold. The flow is a preflight check with the management service, an import into the next backup slot
+(cycling through 9, 10, 11, 12, 8), an import into slot 3, a read back and verification, and a commit. If the
+rotation counts of the units differ, all units are rotated onto the highest count. Like the CLI, rotation stops at
+the first failing unit and returns the results of the units rotated before it.
+
+```go
+spec := &dedicated.MasterKeyPartsSpec{KeyShareFiles: []string{"mk-share1.key#pass1", "mk-share2.key#pass2"}}
+
+state, err := client.GetMasterKeyState(cryptoUnitID)
+// state.RotationCount, state.HashedMBK, ...
+
+results, err := client.RotateMasterKeyOnCryptoUnits(ctx, cryptoUnitIDs, spec)
+switch {
+case errors.Is(err, dedicated.ErrMBKRecordSyncRequired):
+    // HSM rotated, database not updated (single crypto unit): call SyncMasterKeyRecord
+    _, err = client.SyncMasterKeyRecord(cryptoUnitIDs[0])
+case errors.Is(err, dedicated.ErrMBKOutOfSync), errors.Is(err, dedicated.ErrMBKRotationIncomplete):
+    // run the rotation again, it recovers or syncs the crypto units
+}
+```
+
+| Error | Meaning | Recovery |
+| --- | --- | --- |
+| `ErrMBKRotationIncomplete` | The HSM state is partial or could not be confirmed | Run the rotation again |
+| `ErrMBKRecordSyncRequired` | The rotation finished on the HSM but the database was not updated (single crypto unit) | `SyncMasterKeyRecord` |
+| `ErrMBKOutOfSync` | The database commit failed with several crypto units, so their rotation counts differ | Run the rotation again |
+| `ErrMBKSeedFailed` | Import succeeded but the database record was not seeded | `SyncMasterKeyRecord` |
+
+Smart card admins are not supported by this client; use key file based admins.
 
 #### Audit
 
